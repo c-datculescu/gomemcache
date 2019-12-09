@@ -736,6 +736,77 @@ func (c *Client) StatsReset() error {
 	return err
 }
 
+type ItemCachedumpResult struct {
+	Item           string
+	ExpirationTime int
+	Size           int
+	Content        string
+	Error          string
+}
+
+// GetItemsFromSlab some comment
+func (c *Client) GetItemsFromSlab(slabID, counter int) ([]*ItemCachedumpResult, error) {
+	cachedResults := []*ItemCachedumpResult{}
+
+	c.selector.Each(func(addr net.Addr) error {
+		items, err := c.getItemsFromSlab(addr, slabID, counter)
+		if err != nil {
+			return err
+		}
+
+		for _, item := range items {
+			// get the key from memcached if it still exists
+			cachedResults = append(cachedResults, item)
+			value, err := c.Get(item.Item)
+			if err != nil {
+				item.Error = err.Error()
+				continue
+			}
+			item.Content = string(value.Value)
+		}
+
+		return nil
+	})
+
+	return cachedResults, nil
+}
+
+func (c *Client) getItemsFromSlab(addr net.Addr, slabID, counter int) ([]*ItemCachedumpResult, error) {
+	cmd := "stats cachedump " + strconv.Itoa(slabID) + " " + strconv.Itoa(counter) + "\r\n"
+
+	var items = []*ItemCachedumpResult{}
+
+	return items, c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
+		line, err := writeReadLine(rw, cmd)
+		if err != nil {
+			return err
+		}
+
+		if bytes.HasPrefix(line, resultClientErrorPrefix) {
+			errMsg := line[len(resultClientErrorPrefix) : len(line)-2]
+			return errors.New("memcache: client error: " + string(errMsg))
+		}
+
+		for err == nil && !bytes.Equal(line, resultEnd) {
+			s := bytes.Split(line, []byte(" "))
+			if len(s) == 6 {
+				item := string(s[1])
+				size, _ := strconv.Atoi(strings.Replace(string(s[2]), "[", "", -1))
+				expiration, _ := strconv.Atoi(string(s[4]))
+
+				items = append(items, &ItemCachedumpResult{
+					Item:           item,
+					ExpirationTime: expiration,
+					Size:           size,
+				})
+			}
+			line, err = rw.ReadSlice('\n')
+		}
+
+		return nil
+	})
+}
+
 func (c *Client) statsFromAddr(addr net.Addr, cb func(Stats)) error {
 	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
 		cmds := []string{"stats\r\n", "stats slabs\r\n", "stats items\r\n"}
